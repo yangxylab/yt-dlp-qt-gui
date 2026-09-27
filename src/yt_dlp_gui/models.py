@@ -41,6 +41,7 @@ class DownloadTask:
     impersonate: Optional[str] = None
     no_cookies: bool = False
     cookie_browser: Optional[str] = None  # 从本机浏览器导入 cookies：chrome / edge / None
+    write_danmaku: bool = False  # B 站弹幕下载（其他平台忽略）
     ratelimit: Optional[str] = None  # 下载限速 (例如: "2M", "500K")
     created_at: Optional[str] = None
 
@@ -79,6 +80,7 @@ class DownloadTask:
             impersonate=data.get("impersonate") or None,
             no_cookies=bool(data.get("no_cookies", False)),
             cookie_browser=data.get("cookie_browser") or None,
+            write_danmaku=bool(data.get("write_danmaku", False)),
             ratelimit=data.get("ratelimit") or None,
             created_at=data.get("created_at"),
         )

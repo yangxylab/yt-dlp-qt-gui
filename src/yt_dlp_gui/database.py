@@ -169,6 +169,7 @@ class Database:
                     impersonate TEXT,
                     no_cookies BOOLEAN DEFAULT 0,
                     cookie_browser TEXT,
+                    write_danmaku BOOLEAN DEFAULT 0,
                     ratelimit TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -184,6 +185,8 @@ class Database:
                 conn.execute("ALTER TABLE tasks ADD COLUMN cookie_browser TEXT")
             if "ratelimit" not in columns:
                 conn.execute("ALTER TABLE tasks ADD COLUMN ratelimit TEXT")
+            if "write_danmaku" not in columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN write_danmaku BOOLEAN DEFAULT 0")
             conn.commit()
 
         self._execute_sync(init_func)
@@ -195,8 +198,9 @@ class Database:
                     url, title, status, save_path, format_preset, proxy,
                     concurrent_fragments, write_subs, download_playlist,
                     playlist_items, playlist_random, max_downloads,
-                    impersonate, no_cookies, cookie_browser, ratelimit
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    impersonate, no_cookies, cookie_browser,
+                    write_danmaku, ratelimit
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
             params = (
                 task.url,
@@ -214,6 +218,7 @@ class Database:
                 task.impersonate,
                 task.no_cookies,
                 task.cookie_browser,
+                task.write_danmaku,
                 task.ratelimit,
             )
             cursor = conn.execute(query, params)

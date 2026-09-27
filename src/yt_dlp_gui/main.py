@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QSizePolicy,
+    QSpinBox,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QTableView,
@@ -47,7 +48,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .config import STYLESHEET_FILE, get_task_log_path
+from .config import STYLESHEET_FILE, get_task_log_path, load_ui_state, save_ui_state
 from .database import Database
 from .dialogs import DialogManager
 from .models import DownloadStatus, DownloadTask, TaskTableModel
@@ -181,6 +182,12 @@ class MainWindow(QMainWindow):
 
         # 数据模型初始化
         self.table_model = TaskTableModel()
+
+        # 恢复上次最大并发下载数（持久化在 ui_state.json）
+        ui_state = load_ui_state()
+        saved_conc = ui_state.get("max_concurrent_downloads")
+        if isinstance(saved_conc, int) and 1 <= saved_conc <= 10:
+            self.scheduler.set_max_concurrent_downloads(saved_conc)
 
         # 连接调度器信号
         self.scheduler.task_added.connect(self._add_task_to_table)
@@ -319,6 +326,20 @@ class MainWindow(QMainWindow):
         info_action.triggered.connect(self._show_about_dialog)
         toolbar.addAction(info_action)
 
+        toolbar.addSeparator()
+
+        # 最大并发下载数
+        conc_label = QLabel(" 并发: ")
+        conc_label.setStyleSheet("color: #AAAAAA;")
+        toolbar.addWidget(conc_label)
+        self.concurrent_spin = QSpinBox()
+        self.concurrent_spin.setRange(1, 10)
+        self.concurrent_spin.setValue(self.scheduler.max_concurrent_downloads)
+        self.concurrent_spin.setFixedWidth(55)
+        self.concurrent_spin.setToolTip("同时运行的最大下载任务数（1-10）")
+        self.concurrent_spin.valueChanged.connect(self._on_concurrent_changed)
+        toolbar.addWidget(self.concurrent_spin)
+
         # 排序控件：弹性间隔 + QToolButton+QMenu，风格与左侧工具栏按鈕完全一致
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -353,7 +374,7 @@ class MainWindow(QMainWindow):
         self.sort_button.setMenu(_sort_menu)
         toolbar.addWidget(self.sort_button)
 
-    def _update_status_counts(self):
+    def _update_status_counts(self) -> None:
         total = self.table_model.rowCount()
         selected = len(self.table.selectionModel().selectedRows())
         self.task_count_info.setText(f"{total} 个项目, 已选择 {selected} 个  ")
@@ -370,6 +391,14 @@ class MainWindow(QMainWindow):
     def _show_about_dialog(self) -> None:
         """显示「关于」对话框"""
         self.dialog_manager.show_about(__version__)
+
+    def _on_concurrent_changed(self, val: int) -> None:
+        """并发数 spinbox 变化：实时推 scheduler + 持久化"""
+        try:
+            self.scheduler.set_max_concurrent_downloads(val)
+        except ValueError:
+            return
+        save_ui_state({"max_concurrent_downloads": val})
 
     def _on_sort_changed(self, label: str) -> None:
         """排序选项变更时更新按鈕文字并重新加载"""
@@ -553,9 +582,15 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _show_add_dialog(self, initial_url: str | None = None) -> None:
-        task = self.dialog_manager.show_add_task(initial_url=initial_url)
-        if task:
-            self.scheduler.add_task(task)
+        tasks = self.dialog_manager.show_add_task(initial_url=initial_url)
+        if not tasks:
+            return
+        if len(tasks) == 1:
+            self.scheduler.add_task(tasks[0])
+            return
+        # playlist explode：多条任务，批量入队
+        for t in tasks:
+            self.scheduler.add_task(t)
 
     def _get_task_id_from_row(self, row):
         index = self.proxy_model.index(row, 0)
@@ -666,8 +701,8 @@ class MainWindow(QMainWindow):
         self.table_model.update_task_data(task_id, data)
 
     @Slot(int, str)
-    def _on_log(self, task_id, msg):
-        # 如果日志窗口打开，实时更新
+    def _on_log(self, task_id: int, msg: str) -> None:
+        """转发 worker 日志到单独打开的日志弹窗"""
         if task_id in self.active_log_dialogs:
             self.active_log_dialogs[task_id].append_log(msg)
 

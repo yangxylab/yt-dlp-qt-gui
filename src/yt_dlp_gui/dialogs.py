@@ -1,9 +1,10 @@
 import os
+import re
 from typing import Any, Callable, Optional
 
 import qtawesome as qta
 from PySide6.QtCore import QObject, QStandardPaths, Qt, QThread, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QFont
+from PySide6.QtGui import QBrush, QColor, QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -30,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from .components import Switch
-from .config import FORMAT_PRESETS, get_last_save_path, save_ui_state
+from .config import FORMAT_PRESETS, get_last_save_path, load_ui_state, save_ui_state
 from .models import DownloadTask
 
 
@@ -85,6 +86,7 @@ class FormatPreviewWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
+            import gc
             import yt_dlp
             from yt_dlp.networking.impersonate import ImpersonateTarget
 
@@ -97,6 +99,11 @@ class FormatPreviewWorker(QObject):
                 "socket_timeout": 30,
                 "retries": 3,
                 "nocheckcertificate": True,
+                # playlist 不要递归深入每个子项（会把所有子项的 formats/thumbnails/description 全拉进来，
+                # 一条 B 站 bangumi 可能吃掉几百 MB，十几条就是 GB 级 RSS）。
+                # lazy_playlist 只拉目录树（id + url + title），不深挖子项 format。
+                "lazy_playlist": True,
+                "ignoreerrors": True,
             }
             if self.proxy:
                 opts["proxy"] = self.proxy
@@ -110,7 +117,52 @@ class FormatPreviewWorker(QObject):
 
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(self.url, download=False)
+
+            # lazy_playlist=True 后，playlist entries 里没有 formats（只有目录树 id+url+title）。
+            # 手动对第一条有 url 的 entry 深入 resolve 一次，把它的 formats 塞回顶层
+            # → 底部视频/音频轨道表就有数据了
+            if info.get("_type") == "playlist":
+                entries = info.get("entries") or []
+                # 找一条有效 entry
+                probe_url: str | None = None
+                for e in entries:
+                    if not e:
+                        continue
+                    if e.get("url"):
+                        probe_url = e["url"]
+                        break
+                    if e.get("_type") == "url" and e.get("webpage_url"):
+                        probe_url = e["webpage_url"]
+                        break
+                if probe_url:
+                    try:
+                        # 新建一个 YoutubeDL 实例单独 resolve 这一条
+                        probe_opts = dict(opts)
+                        # resolve 一条时关闭 lazy_playlist
+                        probe_opts.pop("lazy_playlist", None)
+                        with yt_dlp.YoutubeDL(probe_opts) as pydl:
+                            probe_info = pydl.extract_info(probe_url, download=False)
+                        # 把 formats 复制回顶层 info（如果顶层还没有）
+                        if not info.get("formats") and probe_info.get("formats"):
+                            info["formats"] = probe_info["formats"]
+                        # 顺手给对应的 entry 也补上 formats（不影响整体 RSS，只有 1 条）
+                        for e in entries:
+                            if e and str(e.get("id")) == str(probe_info.get("id")):
+                                e["formats"] = probe_info.get("formats", [])
+                                break
+                        _shrink_info(probe_info)
+                        probe_info = None
+                    except Exception:
+                        # probe 失败不影响主流程
+                        pass
+
+            # 精简 info：去掉大字段，避免 moveToThread 序列化时占内存
+            _shrink_info(info)
+
             self.finished.emit(info)
+            # emit 后立即清掉 worker 里的引用 + 强制 GC，防止 RSS 被重复持有
+            info = None
+            gc.collect()
         except Exception as e:
             self.error.emit(str(e))
 
@@ -129,20 +181,79 @@ def _format_filesize(n: int | float | None) -> str:
     return f"{n:.1f} TB"
 
 
+# 要删掉的大字段（它们不影响我们展示格式/条目列表）
+# 注意：formats 字段**保留**——底部视频/音频轨道表就是靠它
+_BLOAT_KEYS = {
+    "description", "thumbnails", "automatic_captions",
+    "subtitles", "heatmap", "comments", "chapters",
+    "requested_downloads", "requested_formats", "live_status",
+}
+
+
+def _shrink_info(info: Any) -> None:
+    """递归删除 yt-dlp extract_info 返回 dict 里不展示/不需要的大字段，
+    避免 moveToThread 序列化时占掉几百 MB 甚至 GB RSS。"""
+    if isinstance(info, dict):
+        for k in list(info.keys()):
+            if k in _BLOAT_KEYS:
+                info.pop(k, None)
+            else:
+                _shrink_info(info[k])
+    elif isinstance(info, list):
+        for item in info:
+            _shrink_info(item)
+
+
 class FormatPreviewDialog(QDialog):
-    """格式预览对话框：列出所有可用视频+音频轨道，让用户挑"""
+    """格式预览对话框：播放列表时顶部让用户勾选条目，底部让用户挑视频+音频轨道"""
 
     def __init__(self, info: dict[str, Any], parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("选择下载格式")
-        self.resize(920, 560)
+        self.resize(1020, 720)
         self.video_format_id: Optional[str] = None
         self.audio_format_id: Optional[str] = None
+
+        # 合集条目（如果是 playlist 类型）
+        self._playlist_entries: list[dict[str, Any]] = []
+        self._playlist_items_str: str | None = None  # 用户确认后自动生成
+
+        # 判断是不是合集
+        entries = info.get("entries") or []
+        if info.get("_type") == "playlist" or entries:
+            self._playlist_entries = [e for e in entries if e]
+
+        # 格式源：单视频 → 顶层 formats；playlist → 找 entries 里第一条带 formats 的子项
         self._formats: list[dict[str, Any]] = info.get("formats", [])
+        if not self._formats and self._playlist_entries:
+            for e in self._playlist_entries:
+                if e.get("formats"):
+                    self._formats = e["formats"]
+                    break
 
         title = info.get("title", "") or info.get("id", "")
         self._build_ui(title, info)
         self._populate_tables(self._formats)
+        if self._playlist_entries:
+            self._populate_playlist_table()
+
+    # ---------- 自动分组 ----------
+    @staticmethod
+    def _detect_group(title: str) -> tuple[str, str]:
+        """从条目标题里推断 (组标签, 标签颜色) 。
+        返回值用于 UI 上的 pill 徽标。"""
+        t = title or ""
+        # 匹配中配 / 国语配音 / 译制 / 中配版
+        if re.search(r"中配|国语|译制|中配版|普通话", t):
+            return ("中配版", "#E6A23C")
+        # 匹配日语原版 / 原声 / 日语
+        if re.search(r"日语|原声|原版|日版|生肉", t):
+            return ("日语版", "#2980B9")
+        # 匹配花絮 / 预告 / OP / ED / PV
+        if re.search(r"花絮|预告|PV|OP|ED|片头曲|片尾曲", t):
+            return ("特典", "#8E44AD")
+        # 正片兜底
+        return ("正片", "#27AE60")
 
     # ---------- UI ----------
     def _build_ui(self, title: str, info: dict[str, Any]) -> None:
@@ -154,11 +265,51 @@ class FormatPreviewDialog(QDialog):
         meta.setWordWrap(True)
         layout.addWidget(meta)
 
+        # ====== 合集条目选择区（playlist 才有）======
+        if self._playlist_entries:
+            playlist_box = QGroupBox(f"合集条目（共 {len(self._playlist_entries)} 条，可勾选）")
+            pl_layout = QVBoxLayout()
+
+            # 工具栏：全选 / 反选 / 关键词过滤
+            bar = QHBoxLayout()
+            self._pl_filter_input = QLineEdit()
+            self._pl_filter_input.setPlaceholderText("关键词过滤（留空显示全部），例如：正片 / 中配 / 波涛")
+            self._pl_filter_input.textChanged.connect(self._on_pl_filter)
+            bar.addWidget(self._pl_filter_input, 1)
+
+            btn_all = QPushButton("全选")
+            btn_all.clicked.connect(lambda: self._pl_check_all(True))
+            bar.addWidget(btn_all)
+            btn_none = QPushButton("全不选")
+            btn_none.clicked.connect(lambda: self._pl_check_all(False))
+            bar.addWidget(btn_none)
+            btn_invert = QPushButton("反选")
+            btn_invert.clicked.connect(self._pl_invert)
+            bar.addWidget(btn_invert)
+            pl_layout.addLayout(bar)
+
+            self._pl_summary = QLabel("")
+            self._pl_summary.setStyleSheet("color:#AAA; font-size:11px;")
+            pl_layout.addWidget(self._pl_summary)
+
+            self.playlist_table = self._make_playlist_table()
+            self.playlist_table.itemChanged.connect(self._on_pl_item_changed)
+            pl_layout.addWidget(self.playlist_table, 1)
+
+            playlist_box.setLayout(pl_layout)
+            layout.addWidget(playlist_box, 2)  # playlist 占 2 份，下面视频轨道占 1 份
+
+        # ====== 视频 / 音频轨道 ======
         grid = QGridLayout()
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
         grid.addWidget(QLabel("视频轨道"), 0, 0)
         grid.addWidget(QLabel("音频轨道"), 0, 1)
-        self.video_table = self._make_table()
-        self.audio_table = self._make_table()
+        self.video_table = self._make_format_table("video")
+        self.audio_table = self._make_format_table("audio")
+        # 防止表格被挤得太窄导致分辨率/采样率列看不见
+        self.video_table.setMinimumWidth(340)
+        self.audio_table.setMinimumWidth(340)
         grid.addWidget(self.video_table, 1, 0)
         grid.addWidget(self.audio_table, 1, 1)
         layout.addLayout(grid, 1)
@@ -183,26 +334,273 @@ class FormatPreviewDialog(QDialog):
         self._btns = btns
         self._update_ok_enabled()
 
-    def _make_table(self) -> QTableWidget:
-        t = QTableWidget(0, 5)
-        t.setHorizontalHeaderLabels(["格式 ID", "分辨率", "帧率", "编码", "大小"])
+    def _make_format_table(self, kind: str = "video") -> QTableWidget:
+        """轨道表。kind='video' 显示分辨率/帧率，kind='audio' 显示采样率/码率"""
+        if kind == "audio":
+            headers = ["格式 ID", "编码", "采样率", "码率", "大小"]
+        else:
+            headers = ["格式 ID", "分辨率", "帧率", "编码", "大小"]
+        t = QTableWidget(0, len(headers))
+        t.setHorizontalHeaderLabels(headers)
         t.verticalHeader().setVisible(False)
         t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         t.setAlternatingRowColors(True)
-        t.setStyleSheet(
-            "QTableWidget { background:#1E1E1E; alternate-background-color:#252525; color:#E0E0E0; }"
-            "QHeaderView::section { background:#2D2D2D; color:#CCC; padding:4px; border:0; }"
-            "QTableWidget::item:selected { background:#004C8C; }"
-        )
-        t.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        # 格式 ID 列：固定宽度 90px（含 DoVi 标记也够），不参与挤压
+        t.setColumnWidth(0, 90)
+        t.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        # 第 2 列（视频=分辨率 / 音频=编码）：Stretch 吃掉剩余空间
         t.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        # 其余列：按内容自适应
         t.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         t.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         t.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         return t
 
-    # ---------- 填数据 ----------
+    def _make_playlist_table(self) -> QTableWidget:
+        """合集条目表（checkable + 分组标签）"""
+        t = QTableWidget(0, 4)
+        t.setHorizontalHeaderLabels(["", "组", "标题", "ID"])
+        t.verticalHeader().setVisible(False)
+        t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        t.setAlternatingRowColors(True)
+        t.setColumnWidth(0, 36)   # checkbox 列
+        t.setColumnWidth(1, 80)   # 组标签列
+        t.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        t.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        return t
+
+    # ---------- 填 playlist ----------
+    def _populate_playlist_table(self) -> None:
+        """把所有条目塞进 playlist_table，默认全选；组标签按自动检测标色"""
+        self.playlist_table.blockSignals(True)
+        self.playlist_table.clearContents()
+        self.playlist_table.setRowCount(0)
+        self._pl_all_indices: list[int] = []  # 行号 ↔ entries 下标 映射
+
+        keyword = self._pl_filter_input.text().strip().lower() if hasattr(self, "_pl_filter_input") else ""
+        visible = 0
+        for i, e in enumerate(self._playlist_entries):
+            title = e.get("title") or f"条目 #{i+1}"
+            if keyword and keyword not in title.lower():
+                continue  # 被关键词过滤掉
+            group, color = self._detect_group(title)
+            row = self.playlist_table.rowCount()
+            self.playlist_table.insertRow(row)
+
+            # 列 0：checkbox（默认全选）
+            cb_item = QTableWidgetItem()
+            cb_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            cb_item.setCheckState(Qt.CheckState.Checked)
+            self.playlist_table.setItem(row, 0, cb_item)
+
+            # 列 1：组标签（带颜色背景）
+            group_item = QTableWidgetItem(group)
+            group_item.setForeground(QBrush(QColor("white")))
+            group_item.setBackground(QBrush(QColor(color)))
+            group_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.playlist_table.setItem(row, 1, group_item)
+
+            # 列 2：标题
+            self.playlist_table.setItem(row, 2, QTableWidgetItem(title))
+
+            # 列 3：yt-dlp index（注意是 1-based）
+            self.playlist_table.setItem(row, 3, QTableWidgetItem(str(i + 1)))
+
+            self._pl_all_indices.append(i)
+            visible += 1
+
+        self.playlist_table.blockSignals(False)
+        self._update_pl_summary()
+
+    # ---------- playlist 工具栏回调 ----------
+    def _on_pl_filter(self, text: str) -> None:
+        """关键词变化 → 重新填充（保留勾选逻辑：过滤掉的条目不影响总勾选结果）"""
+        self._populate_playlist_table()
+
+    def _pl_check_all(self, checked: bool) -> None:
+        self.playlist_table.blockSignals(True)
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for r in range(self.playlist_table.rowCount()):
+            item = self.playlist_table.item(r, 0)
+            if item:
+                item.setCheckState(state)
+        self.playlist_table.blockSignals(False)
+        self._update_pl_summary()
+
+    def _pl_invert(self) -> None:
+        self.playlist_table.blockSignals(True)
+        for r in range(self.playlist_table.rowCount()):
+            item = self.playlist_table.item(r, 0)
+            if item:
+                cur = item.checkState()
+                item.setCheckState(Qt.CheckState.Unchecked if cur == Qt.CheckState.Checked else Qt.CheckState.Checked)
+        self.playlist_table.blockSignals(False)
+        self._update_pl_summary()
+
+    def _on_pl_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() == 0:
+            self._update_pl_summary()
+
+    def _update_pl_summary(self) -> None:
+        """更新底部文字：已选 X / Y 条"""
+        checked = sum(
+            1 for r in range(self.playlist_table.rowCount())
+            if (self.playlist_table.item(r, 0).checkState() == Qt.CheckState.Checked)
+        )
+        total = self.playlist_table.rowCount()
+        # 顺便把选中的条目序号（1-based）转成 yt-dlp playlist_items 格式
+        selected_indices_1based: list[int] = []
+        for r in range(total):
+            if self.playlist_table.item(r, 0).checkState() == Qt.CheckState.Checked:
+                selected_indices_1based.append(r + 1)
+        self._pl_summary.setText(
+            f"已选 <b>{checked}</b> / {total} 条  |  "
+            f"yt-dlp playlist_items: <code>{self._compress_range(selected_indices_1based) or '(全部)'}</code>"
+        )
+
+    @staticmethod
+    def _compress_range(nums: list[int]) -> str:
+        """把 [1,3,4,5,8] 压缩成 '1,3-5,8'"""
+        if not nums:
+            return ""
+        nums = sorted(nums)
+        parts: list[str] = []
+        start = prev = nums[0]
+        for n in nums[1:]:
+            if n == prev + 1:
+                prev = n
+            else:
+                parts.append(f"{start}-{prev}" if start != prev else str(start))
+                start = prev = n
+        parts.append(f"{start}-{prev}" if start != prev else str(start))
+        return ",".join(parts)
+
+    @staticmethod
+    def _expand_range(s: Optional[str]) -> Optional[set[int]]:
+        """把 '1,3-5,8' 展开成 {1,3,4,5,8}；None/空返回 None（表示全部）"""
+        if not s:
+            return None
+        result: set[int] = set()
+        for part in s.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                a, _, b = part.partition("-")
+                try:
+                    result.update(range(int(a), int(b) + 1))
+                except ValueError:
+                    continue
+            else:
+                try:
+                    result.add(int(part))
+                except ValueError:
+                    continue
+        return result or None
+
+    @staticmethod
+    def extract_playlist_entries(
+        url: str,
+        proxy: Optional[str] = None,
+        impersonate: Optional[str] = None,
+        cookie_browser: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """轻量 pre-parse：只拿 playlist 目录树（entries 的 url + title），不拉 formats。
+        返回的每个 entry 保证有 'url' 或 'webpage_url'（兜底两个字段）。"""
+        import yt_dlp
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+
+        opts: dict[str, Any] = {
+            "quiet": True,
+            "skip_download": True,
+            "extract_flat": True,   # 只拉目录树，毫秒级
+            "lazy_playlist": False, # extract_flat 需要解析目录，不能 lazy
+            "writesubtitles": False,
+            "writeautomaticsub": False,
+            "socket_timeout": 15,
+            "retries": 2,
+            "nocheckcertificate": True,
+            "ignoreerrors": True,
+        }
+        if proxy:
+            opts["proxy"] = proxy
+        if cookie_browser:
+            opts["cookiesfrombrowser"] = (cookie_browser,)
+        if impersonate:
+            try:
+                opts["impersonate"] = ImpersonateTarget.from_str(impersonate)
+            except Exception:
+                opts["impersonate"] = impersonate
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        raw = info.get("entries") or []
+        result: list[dict[str, Any]] = []
+        for entry in raw:
+            if not entry:
+                continue
+            # extract_flat 模式下 entry 结构：{_type:'url', id, url, webpage_url, title}
+            ep_url = entry.get("webpage_url") or entry.get("url") or ""
+            if not ep_url and entry.get("_type") == "url":
+                # 某些 extractor（BilibiliBangumi）extract_flat 只给 id 不给 url
+                # 构造兜底 URL（bangumi 从 media 页面来的话，entry.id 是 ep_id）
+                ep_id = entry.get("id", "")
+                if ep_id:
+                    ep_url = f"{url.split('?')[0]}?ep_id={ep_id}"
+            result.append({
+                "url": ep_url,
+                "title": entry.get("title") or f"条目 #{entry.get('_playlist_index', len(result)+1)}",
+                "_playlist_index": entry.get("_playlist_index", len(result) + 1),
+            })
+        return result
+
+    @staticmethod
+    def explode_playlist_to_tasks(
+        url: str,
+        proxy: Optional[str],
+        impersonate: Optional[str],
+        cookie_browser: Optional[str],
+        playlist_items_str: Optional[str],
+        **task_kwargs,
+    ) -> list["DownloadTask"]:
+        """把一条 playlist URL explode 成多条独立 DownloadTask。
+
+        Args:
+            playlist_items_str: '1,3-5,8' → 只建这几条；None → 建全部
+            **task_kwargs: 透传给 DownloadTask（save_path, format_preset, ...）
+        """
+        from .models import DownloadTask
+
+        entries = FormatPreviewDialog.extract_playlist_entries(
+            url, proxy=proxy, impersonate=impersonate, cookie_browser=cookie_browser,
+        )
+        if not entries:
+            return []
+
+        # 过滤：_playlist_items_str 是 1-based 下标集合
+        selected = FormatPreviewDialog._expand_range(playlist_items_str)
+        selected_entries = entries if selected is None else [
+            e for e in entries if e["_playlist_index"] in selected
+        ]
+
+        tasks: list[DownloadTask] = []
+        for e in selected_entries:
+            if not e["url"]:
+                continue
+            task = DownloadTask(
+                url=e["url"],
+                title=e["title"],  # 预填 title，跳过解析
+                download_playlist=False,
+                playlist_items=None,
+                **task_kwargs,
+            )
+            tasks.append(task)
+        return tasks
+
+
+    # ---------- 填 format ----------
     def _populate_tables(self, formats: list[dict[str, Any]]) -> None:
         videos = [f for f in formats if (f.get("vcodec") or "") != "none"]
         audios = [
@@ -216,34 +614,54 @@ class FormatPreviewDialog(QDialog):
         # 音频表：按 abr 降序
         audios.sort(key=lambda f: float(str(f.get("abr") or 0)), reverse=True)
 
-        def _row(table: QTableWidget, f: dict[str, Any]) -> None:
+        def _video_row(table: QTableWidget, f: dict[str, Any]) -> None:
             row = table.rowCount()
             table.insertRow(row)
-            # 杜比视界：优先读 dynamic_range，fallback 到 format_note
             dyn = f.get("dynamic_range") or ""
             note = f.get("format_note") or ""
             dovi = dyn == "dv" or "dovi" in note.lower()
             hdr = dyn and dyn != "dv" and dyn != "sdr"
             res = f.get("resolution") or f"{f.get('width', '')}x{f.get('height', '')}"
             fps = f.get("fps")
-            codec = f.get("vcodec") if table is self.video_table else f.get("acodec")
+            codec = f.get("vcodec") or ""
             if dovi:
-                codec = (codec or "") + " (DoVi)"
+                codec = codec + " (DoVi)"
             elif hdr:
-                codec = (codec or "") + f" (HDR {dyn.upper()})"
+                codec = codec + f" (HDR {dyn.upper()})"
             size = f.get("filesize") or f.get("filesize_approx")
             table.setItem(
                 row, 0, QTableWidgetItem(str(f.get("format_id", "")) + ("  ★杜比" if dovi else ""))
             )
             table.setItem(row, 1, QTableWidgetItem(str(res)))
             table.setItem(row, 2, QTableWidgetItem(f"{fps:g}fps" if fps else "—"))
-            table.setItem(row, 3, QTableWidgetItem(str(codec or "")))
+            table.setItem(row, 3, QTableWidgetItem(str(codec)))
+            table.setItem(row, 4, QTableWidgetItem(_format_filesize(size)))
+
+        def _audio_row(table: QTableWidget, f: dict[str, Any]) -> None:
+            row = table.rowCount()
+            table.insertRow(row)
+            acodec = f.get("acodec") or ""
+            # 采样率：yt-dlp 给的是 Hz → 转 kHz（44100 → "44.1 kHz"，48000 → "48 kHz"）
+            asr = f.get("asr")
+            if asr:
+                khz = asr / 1000
+                asr_khz = f"{khz:.1f}".rstrip("0").rstrip(".") + " kHz"
+            else:
+                asr_khz = "—"
+            # 码率
+            abr = f.get("abr")
+            abr_str = f"{int(abr)} kbps" if abr else "—"
+            size = f.get("filesize") or f.get("filesize_approx")
+            table.setItem(row, 0, QTableWidgetItem(str(f.get("format_id", ""))))
+            table.setItem(row, 1, QTableWidgetItem(str(acodec)))
+            table.setItem(row, 2, QTableWidgetItem(asr_khz))
+            table.setItem(row, 3, QTableWidgetItem(abr_str))
             table.setItem(row, 4, QTableWidgetItem(_format_filesize(size)))
 
         for f in videos:
-            _row(self.video_table, f)
+            _video_row(self.video_table, f)
         for f in audios:
-            _row(self.audio_table, f)
+            _audio_row(self.audio_table, f)
 
         self.video_table.itemSelectionChanged.connect(self._update_ok_enabled)
         self.audio_table.itemSelectionChanged.connect(self._update_ok_enabled)
@@ -259,13 +677,29 @@ class FormatPreviewDialog(QDialog):
         return item.text().split()[0]  # 去掉 " ★杜比"
 
     def _update_ok_enabled(self) -> None:
-        self._btns.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
-            self.video_table.currentRow() >= 0 and self.audio_table.currentRow() >= 0
-        )
+        fmt_ok = self.video_table.currentRow() >= 0 and self.audio_table.currentRow() >= 0
+        # 如果有 playlist，至少得勾一条
+        if self._playlist_entries:
+            pl_checked = any(
+                self.playlist_table.item(r, 0).checkState() == Qt.CheckState.Checked
+                for r in range(self.playlist_table.rowCount())
+            )
+            fmt_ok = fmt_ok and pl_checked
+        self._btns.button(QDialogButtonBox.StandardButton.Ok).setEnabled(fmt_ok)
 
     def _on_ok(self) -> None:
         self.video_format_id = self._selected_format_id(self.video_table)
         self.audio_format_id = self._selected_format_id(self.audio_table)
+        if self._playlist_entries:
+            # 生成 playlist_items 字符串（yt-dlp 原生支持）
+            selected_1based: list[int] = []
+            for r in range(self.playlist_table.rowCount()):
+                if self.playlist_table.item(r, 0).checkState() == Qt.CheckState.Checked:
+                    selected_1based.append(r + 1)
+            if 0 < len(selected_1based) < self.playlist_table.rowCount():
+                self._playlist_items_str = self._compress_range(selected_1based)
+            else:
+                self._playlist_items_str = None  # 全部 or 全不选 → 不写，让 yt-dlp 用默认行为
         if self.video_format_id and self.audio_format_id:
             self.accept()
 
@@ -274,6 +708,10 @@ class FormatPreviewDialog(QDialog):
         if self.video_format_id and self.audio_format_id:
             return f"{self.video_format_id}+{self.audio_format_id}"
         return ""
+
+    def get_playlist_items_str(self) -> Optional[str]:
+        """给 yt-dlp --playlist-items 用的字符串，例如 '1,3-5,8'；None = 全部"""
+        return self._playlist_items_str
 
     def get_human_label(self) -> str:
         """给用户看的人类可读标签，例如 'DoVi 3840x2160 HEVC / AAC 192kbps'"""
@@ -309,6 +747,7 @@ class AddTaskDialog(QDialog):
         self.selected_download_path = get_last_save_path()
         self._format_spec: str = ""  # 用户手动选的 format_id+format_id
         self._format_human_label: str = ""  # 显示给用户看的格式描述
+        self._playlist_items_str: Optional[str] = None  # FormatPreviewDialog 返回的勾选压缩串
         self._parse_thread: Optional[QThread] = None
         self._parse_worker: Optional[FormatPreviewWorker] = None
         self._setup_ui()
@@ -388,15 +827,41 @@ class AddTaskDialog(QDialog):
         options_layout.addWidget(QLabel("下载限速:"), 2, 0)
         options_layout.addWidget(self.ratelimit_input, 2, 1)
 
-        # 浏览器 Cookies：从本机 Chrome / Edge 导入（Safari 暂不支持）
+        # 浏览器 Cookies：从本机浏览器导入
+        # 注意：yt-dlp cookiesfrombrowser 只认小写 ("edge" / "chrome")，
+        # 这里直接按小写显示，全链路免掉到处 .lower()
         self.cookie_browser_combo = QComboBox()
         self.cookie_browser_combo.setView(QListView())
-        self.cookie_browser_combo.addItems(["不导入", "Chrome", "Edge"])
+        self.cookie_browser_combo.addItems(["不导入", "chrome", "edge"])
         options_layout.addWidget(QLabel("导入 Cookies:"), 2, 2)
         options_layout.addWidget(self.cookie_browser_combo, 2, 3)
 
+        # 恢复上次选择的浏览器伪装 / cookies 导入（持久化到 ui_state.json）
+        ui_state = load_ui_state()
+        last_imp = ui_state.get("last_impersonate", "")
+        if last_imp:
+            idx = self.impersonate_combo.findText(last_imp)
+            if idx >= 0:
+                self.impersonate_combo.setCurrentIndex(idx)
+        last_cookie = ui_state.get("last_cookie_browser", "")
+        if last_cookie:
+            idx = self.cookie_browser_combo.findText(last_cookie)
+            if idx >= 0:
+                self.cookie_browser_combo.setCurrentIndex(idx)
+        # 恢复上次选择的下载格式（preset 名）
+        last_fmt = ui_state.get("last_format_preset", "")
+        if last_fmt and self.format_combo.findText(last_fmt) >= 0:
+            self.format_combo.setCurrentText(last_fmt)
+
         self.write_subs_checkbox = Switch("下载字幕")
         options_layout.addWidget(self.write_subs_checkbox, 3, 0, 1, 2)
+
+        # B 站弹幕下载（其他平台自动忽略）
+        self.write_danmaku_checkbox = Switch("下载弹幕")
+        self.write_danmaku_checkbox.setToolTip(
+            "仅对 B 站 URL 生效；其他平台勾选也不会触发"
+        )
+        options_layout.addWidget(self.write_danmaku_checkbox, 3, 2, 1, 2)
 
         # 提示：选了浏览器时显示简要说明
         tip_label = QLabel("选浏览器 → 自动从本机 cookies 库读登录态；不导入 → 匿名抓取")
@@ -410,6 +875,9 @@ class AddTaskDialog(QDialog):
         playlist_layout = QGridLayout()
 
         self.download_playlist_checkbox = Switch("启用")
+        # 默认启用 playlist 下载：如果 URL 是 playlist 会 explode 成多条独立任务，
+        # 如果 URL 是单视频 → explode 返回空 → fallback 一条单视频任务，安全无副作用
+        self.download_playlist_checkbox.setChecked(True)
         playlist_layout.addWidget(QLabel("下载播放列表:"), 0, 0)
         playlist_layout.addWidget(self.download_playlist_checkbox, 0, 1)
 
@@ -449,8 +917,21 @@ class AddTaskDialog(QDialog):
         layout.addLayout(btns_layout)
 
     def _on_confirm_clicked(self) -> None:
-        """确认添加：先持久化当前目录再 accept"""
-        save_ui_state({"last_save_path": self.selected_download_path})
+        """确认添加：先持久化当前目录 + 浏览器选择 + 下载格式，再 accept"""
+        # 统一小写存（yt-dlp cookiesfrombrowser 只认小写 "edge" / "chrome"）
+        imp = self.impersonate_combo.currentText()
+        cookie = self.cookie_browser_combo.currentText()
+        # 下载格式：若用户选了预览框里的具体格式（带 userData），保存 preset 名即可；
+        # 没选的话就是普通 preset 下拉当前值
+        current_combo_text = self.format_combo.currentText()
+        # "已选：xxx" 这种动态插入项不要存——下次还是 preset 更有用
+        fmt_to_save = "" if current_combo_text.startswith("已选") else current_combo_text
+        save_ui_state({
+            "last_save_path": self.selected_download_path,
+            "last_impersonate": imp.lower() if imp and imp != "无" else "",
+            "last_cookie_browser": cookie.lower() if cookie and cookie != "不导入" else "",
+            "last_format_preset": fmt_to_save,
+        })
         self.accept()
 
     def _select_dir(self):
@@ -508,7 +989,14 @@ class AddTaskDialog(QDialog):
         self.parse_btn.setIcon(qta.icon("fa5s.list-alt", color="#FFFFFF"))
         self.parse_progress.setVisible(False)
 
-        if not info.get("formats"):
+        # 判断是否有"可展示的格式"：
+        #   1) 顶层有 formats（单视频）→ 直接 OK
+        #   2) playlist 类型，entries 里至少一条有 formats（合集）→ OK
+        has_formats = bool(info.get("formats"))
+        if not has_formats:
+            entries = info.get("entries") or []
+            has_formats = any(e and (e.get("formats") or e.get("vcodec")) for e in entries)
+        if not has_formats:
             QMessageBox.warning(self, "提示", "该视频没有可用的格式")
             return
         if info.get("is_live"):
@@ -520,6 +1008,13 @@ class AddTaskDialog(QDialog):
             self._format_spec = dlg.get_format_spec()
             self._format_human_label = dlg.get_human_label()
             self._last_url_for_parse = info.get("webpage_url") or self.url_input.text()
+            # 自动把勾选项转成 playlist_items 字符串塞进文本框
+            self._playlist_items_str = dlg.get_playlist_items_str()
+            # 关键：FormatPreviewDialog 弹出来 = URL 是 playlist（单视频 URL 不会弹这个对话框）
+            # 所以不管用户勾选了几条（全部 / 部分），都要勾 Switch
+            self.download_playlist_checkbox.setChecked(True)
+            if self._playlist_items_str is not None:
+                self.playlist_items_input.setText(self._playlist_items_str)
             # 动态刷新 format_combo：头部插入"已选具体格式"项并自动选中
             self._refresh_format_combo_for_selection()
 
@@ -560,7 +1055,12 @@ class AddTaskDialog(QDialog):
             self._parse_thread.wait(1000)
         super().closeEvent(event)
 
-    def get_task_data(self) -> DownloadTask:
+    def get_task_data(self) -> list[DownloadTask]:
+        """返回一条或多条 DownloadTask。
+
+        - 单视频 → 返回 1 条
+        - playlist → explode 成多条（每勾选项一条）；explode 失败则 fallback 一条 playlist 任务
+        """
         impersonate_val = self.impersonate_combo.currentText()
         if impersonate_val == "无":
             impersonate_val = None
@@ -582,24 +1082,74 @@ class AddTaskDialog(QDialog):
             preset_name = self.format_combo.currentText()
             format_preset = FORMAT_PRESETS.get(preset_name, "best")
 
-        return DownloadTask(
-            url=self.url_input.text().strip(),
-            save_path=self.dir_input.text(),
-            format_preset=format_preset,
-            proxy=self.proxy_input.text().strip() or None,
-            concurrent_fragments=int(self.concurrent_input.text())
+        base_kwargs = {
+            "save_path": self.dir_input.text(),
+            "format_preset": format_preset,
+            "proxy": self.proxy_input.text().strip() or None,
+            "concurrent_fragments": int(self.concurrent_input.text())
             if self.concurrent_input.text().isdigit()
             else None,
-            write_subs=self.write_subs_checkbox.isChecked(),
-            download_playlist=self.download_playlist_checkbox.isChecked(),
-            playlist_items=self.playlist_items_input.text().strip() or None,
-            max_downloads=int(self.max_downloads_input.text())
+            "write_subs": self.write_subs_checkbox.isChecked(),
+            "write_danmaku": self.write_danmaku_checkbox.isChecked(),
+            "max_downloads": int(self.max_downloads_input.text())
             if self.max_downloads_input.text().isdigit()
             else None,
-            impersonate=impersonate_val,
-            cookie_browser=cookie_browser_val,
-            ratelimit=self.ratelimit_input.text().strip() or None,
+            "impersonate": impersonate_val,
+            "cookie_browser": cookie_browser_val,
+            "ratelimit": self.ratelimit_input.text().strip() or None,
+        }
+
+        url = self.url_input.text().strip()
+        is_playlist = self.download_playlist_checkbox.isChecked()
+        # playlist_items_str：FormatPreviewDialog 返回的（优先）> 用户手动输入的
+        playlist_items_str = self._playlist_items_str or (
+            self.playlist_items_input.text().strip() or None
         )
+
+        if not is_playlist:
+            # 单视频：一条 task
+            print(f"[get_task_data] 单视频模式: url={url}")
+            return [DownloadTask(url=url, **base_kwargs)]
+
+        # playlist → 尝试 explode
+        try:
+            # explode_playlist_to_tasks 的显式参数是 url/proxy/impersonate/cookie_browser/playlist_items_str，
+            # base_kwargs 里已经有 proxy/impersonate/cookie_browser 三个键
+            # → 全 pop 出来作为显式参数，避免重复传
+            explode_kwargs = dict(base_kwargs)
+            e_proxy = explode_kwargs.pop("proxy", None)
+            e_impersonate = explode_kwargs.pop("impersonate", None)
+            e_cookie_browser = explode_kwargs.pop("cookie_browser", None)
+            tasks = FormatPreviewDialog.explode_playlist_to_tasks(
+                url=url,
+                proxy=e_proxy,
+                impersonate=e_impersonate,
+                cookie_browser=e_cookie_browser,
+                playlist_items_str=playlist_items_str,
+                **explode_kwargs,
+            )
+            if tasks:
+                print(f"[get_task_data] playlist explode 成功: {len(tasks)} 条独立 task, "
+                      f"playlist_items_str={playlist_items_str!r}")
+                return tasks
+            # explode 返回空 → fallback 一条 playlist 任务
+            print(f"[get_task_data] explode 返回空，fallback 单条 playlist 任务")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[get_task_data] explode 抛异常: {e!r}，fallback 单条 playlist 任务")
+            # pre-parse 失败也没关系，fallback 单条 playlist 任务
+
+        # fallback：让 yt-dlp 自己串行跑整个 playlist
+        print(f"[get_task_data] fallback 单条 playlist 任务: url={url} playlist_items={playlist_items_str!r}")
+        return [
+            DownloadTask(
+                url=url,
+                download_playlist=True,
+                playlist_items=playlist_items_str,
+                **base_kwargs,
+            )
+        ]
 
 
 GITHUB_URL = "https://github.com/twn39/yt-dlp-qt-gui"
@@ -706,8 +1256,11 @@ class DialogManager:
         dialog = AboutDialog(version=version, parent=self.parent)
         dialog.exec()
 
-    def show_add_task(self, initial_url: str | None = None) -> Optional[DownloadTask]:
-        """显示添加任务对话框，若确认且数据有效，则返回 DownloadTask 实体，否则返回 None"""
+    def show_add_task(
+        self, initial_url: str | None = None
+    ) -> Optional[list["DownloadTask"]]:
+        """显示添加任务对话框，返回一条或多条 DownloadTask（playlist 会 explode）。
+        用户取消返回 None。"""
         dialog = AddTaskDialog(parent=self.parent, initial_url=initial_url)
         if dialog.exec():
             return dialog.get_task_data()

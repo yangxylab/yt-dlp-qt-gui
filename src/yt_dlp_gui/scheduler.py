@@ -159,6 +159,7 @@ class DownloadScheduler(QObject):
             impersonate=task.impersonate,
             no_cookies=task.no_cookies,
             cookie_browser=task.cookie_browser,
+            write_danmaku=task.write_danmaku,
             ratelimit=task.ratelimit,
         )
         worker.moveToThread(thread)

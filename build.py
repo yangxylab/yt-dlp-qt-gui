@@ -298,6 +298,20 @@ def build():
     # 先确保依赖就绪（可能会重启进程，所以要放在最前面）
     ensure_dependencies()
 
+    # 同步项目自身版本到 venv（pyproject.toml 改了 version 后，
+    # importlib.metadata.version() 读的是 .dist-info/METADATA，
+    # 不做这步打包出来的 About 对话框会显示旧版本）
+    print("[1/5] 同步项目版本到 venv...")
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-e", ".", "--no-deps",
+         "--disable-pip-version-check"],
+        cwd=PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+    )
+    import importlib.metadata as _md
+    print(f"  ✓ 已同步到: {_md.version('yt-dlp-qt-gui')}")
+
     os.chdir(PROJECT_ROOT)
 
     print("=" * 50)

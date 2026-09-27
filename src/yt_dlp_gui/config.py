@@ -21,15 +21,32 @@ DEFAULT_FORMAT: Final[str] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4
 OUTPUT_TEMPLATE: Final[str] = "%(title)s [%(id)s].%(ext)s"
 
 # 格式预设选项（下拉菜单显示）
-# 每个格式都包含回退选项，避免特定分辨率不可用时失败
+# 每个格式都包含回退选项，避免特定编码器/分辨率不可用时失败
+# 注意：selector 字符串依赖 yt-dlp 每次解析视频时动态匹配，
+#       B 站的 format_id（如 30126/30280）不固定，千万别硬编码！
 FORMAT_PRESETS: Final[dict[str, str]] = {
-    "最佳质量 (MP4)": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-    "最佳质量 (任意格式)": "bestvideo+bestaudio/best",
+    # --- 编码器偏好 ---
+    "最佳质量 (任意编码)": "bestvideo+bestaudio/best",
+    "最佳质量 (MP4,任意编码)": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+    "最佳 AV1 (mp4+m4a)": (
+        "bestvideo[vcodec*=av01][ext=mp4]+bestaudio[acodec*=mp4a][ext=m4a]/"
+        "bestvideo[vcodec*=av01]+bestaudio/bestvideo+bestaudio/best"
+    ),
+    "最佳 HEVC/h265 (mp4+m4a)": (
+        "bestvideo[vcodec*=hvc1][ext=mp4]+bestaudio[acodec*=mp4a][ext=m4a]/"
+        "bestvideo[vcodec*=hvc1]+bestaudio/bestvideo+bestaudio/best"
+    ),
+    "最佳 H.264/AVC (mp4+m4a)": (
+        "bestvideo[vcodec*=avc1][ext=mp4]+bestaudio[acodec*=mp4a][ext=m4a]/"
+        "bestvideo[vcodec*=avc1]+bestaudio/bestvideo+bestaudio/best"
+    ),
+    # --- 分辨率偏好（任意编码）---
+    "4K (≤2160p)": "bestvideo[height<=2160]+bestaudio/bestvideo+bestaudio/best",
     "1080p": "bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best",
     "720p": "bestvideo[height<=720]+bestaudio/bestvideo+bestaudio/best",
-    "480p": "bestvideo[height<=480]+bestaudio/bestvideo+bestaudio/best",
+    # --- 仅音频 ---
     "仅音频 (最佳)": "bestaudio/best",
-    "仅音频 (MP3)": "bestaudio[ext=m4a]/bestaudio/best",
+    "仅音频 (MP4/AAC)": "bestaudio[acodec*=mp4a]/bestaudio/best",
 }
 
 # =====================
