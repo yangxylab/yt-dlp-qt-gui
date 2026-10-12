@@ -51,7 +51,7 @@ def test_worker_logger(qtbot):
     assert "错误: Test Error" in blocker.args[1]
 
 
-@patch("yt_dlp.YoutubeDL")
+@patch("yt_dlp_gui.worker._GuidedNamingYoutubeDL")
 def test_worker_run_success(mock_ytdl, qtbot):
     """Test successful worker run with mocked yt-dlp."""
     worker = DownloadWorker(task_id=1, url="https://example.com/v", download_path=".")
@@ -68,7 +68,7 @@ def test_worker_run_success(mock_ytdl, qtbot):
     mock_instance.extract_info.assert_called_once()
 
 
-@patch("yt_dlp.YoutubeDL")
+@patch("yt_dlp_gui.worker._GuidedNamingYoutubeDL")
 def test_worker_run_failure(mock_ytdl, qtbot):
     """Test worker failure handling."""
     worker = DownloadWorker(task_id=1, url="https://example.com/v", download_path=".")
@@ -86,7 +86,7 @@ def test_worker_run_failure(mock_ytdl, qtbot):
     assert "Download Error" in blocker.args[2]
 
 
-@patch("yt_dlp.YoutubeDL")
+@patch("yt_dlp_gui.worker._GuidedNamingYoutubeDL")
 def test_worker_run_complex_config(mock_ytdl, qtbot):
     """Test worker.run with various configuration options."""
     worker = DownloadWorker(
@@ -148,7 +148,7 @@ def test_progress_hook_cancellation():
         worker._progress_hook({"status": "downloading"})
 
 
-@patch("yt_dlp.YoutubeDL")
+@patch("yt_dlp_gui.worker._GuidedNamingYoutubeDL")
 def test_worker_run_impersonate_and_no_cookies(mock_ytdl, qtbot):
     """Test worker.run with impersonation and no-cookies options."""
     worker = DownloadWorker(
@@ -174,9 +174,13 @@ def test_worker_run_impersonate_and_no_cookies(mock_ytdl, qtbot):
     assert opts["no_cookies"] is True
 
 
-@patch("yt_dlp.YoutubeDL")
-def test_worker_run_cookie_browser(mock_ytdl, qtbot):
-    """Test worker.run with cookie_browser option."""
+@patch("yt_dlp.cookies.SUPPORTED_BROWSERS", {"chrome", "edge"})
+@patch("yt_dlp.cookies.extract_cookies_from_browser")
+@patch("yt_dlp_gui.worker._GuidedNamingYoutubeDL")
+def test_worker_run_cookie_browser(mock_ytdl, mock_extract, _mock_browsers, qtbot):
+    """Test that worker.run passes cookiesfrombrowser after successful precheck."""
+    mock_extract.return_value = []  # 假 CookieJar，避免读取真实浏览器数据
+
     worker = DownloadWorker(
         task_id=2,
         url="url",
@@ -187,12 +191,35 @@ def test_worker_run_cookie_browser(mock_ytdl, qtbot):
     with qtbot.waitSignal(worker.finished, timeout=2000):
         worker.run()
 
-    args, kwargs = mock_ytdl.call_args
+    mock_extract.assert_called_once()
+    args, _ = mock_ytdl.call_args
     opts = args[0]
     assert opts["cookiesfrombrowser"] == ("chrome",)
 
 
-@patch("yt_dlp.YoutubeDL")
+@patch("yt_dlp.cookies.SUPPORTED_BROWSERS", {"chrome", "edge"})
+@patch("yt_dlp.cookies.extract_cookies_from_browser")
+@patch("yt_dlp_gui.worker._GuidedNamingYoutubeDL")
+def test_worker_run_cookie_browser_failure(mock_ytdl, mock_extract, _mock_browsers, qtbot):
+    """预检查失败时不得写入 cookiesfrombrowser，任务仍继续（不带 cookies）"""
+    mock_extract.side_effect = RuntimeError("could not find chrome cookies database")
+
+    worker = DownloadWorker(
+        task_id=3,
+        url="url",
+        download_path=".",
+        cookie_browser="chrome",
+    )
+
+    with qtbot.waitSignal(worker.finished, timeout=2000):
+        worker.run()
+
+    args, _ = mock_ytdl.call_args
+    opts = args[0]
+    assert "cookiesfrombrowser" not in opts
+
+
+@patch("yt_dlp_gui.worker._GuidedNamingYoutubeDL")
 def test_worker_run_ratelimit(mock_ytdl, qtbot):
     """Test worker.run with ratelimit option."""
     worker = DownloadWorker(
