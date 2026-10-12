@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 from typing import Any
 
@@ -33,6 +34,51 @@ def _pick_staging_dir() -> str:
             except OSError:
                 continue
     return os.path.expanduser("~")
+
+
+class _GuidedNamingYoutubeDL(yt_dlp.YoutubeDL):
+    """在文件名生成前往 info_dict 注入 name_suffix 字段，供 OUTPUT_TEMPLATE 使用。
+
+    注意 yt-dlp 会对同一条视频多次调用 prepare_filename：
+    早期（格式选定前）vcodec/height 还是 None，格式选定后才有值。
+    所以不能"首次注入后锁定"，必须每次按当前信息重算，
+    并对已算出的非空后缀做 sticky，防止后续衍生调用清空。
+      视频   vcodec='avc1.640028' height=1080 → ' [1080p avc1]'
+      DoVi   vcodec='dvhe.05.06'  height=2160 → ' [2160p dvhe]'
+      纯音频 vcodec='none'                    → None（文件名不带分辨率/编码）
+    """
+
+    @staticmethod
+    def _build_name_suffix(info: dict[str, Any]) -> str | None:
+        vcodec = str(info.get("vcodec") or "")
+        height = info.get("height")
+        # 部分 extractor 不把选中视频轨字段合并到顶层，
+        # 需从 requested_formats 里找视频子轨兜底
+        if (not vcodec or vcodec == "none") and info.get("requested_formats"):
+            for f in info["requested_formats"]:
+                fv = str(f.get("vcodec") or "")
+                if fv and fv != "none":
+                    vcodec, height = fv, f.get("height")
+                    break
+        codec = vcodec.split(".")[0] if vcodec and vcodec != "none" else ""
+        # 编码和分辨率都没有：纯音频，或格式信息尚未到齐的早期探查调用 → 不加后缀
+        if not codec and not height:
+            return None
+        parts = []
+        if height:
+            parts.append(f"{height}p")
+        if codec:
+            parts.append(codec)
+        return f" [{' '.join(parts)}]"
+
+    def prepare_filename(self, info_dict, dir_type: str = "", *, outtmpl=None, warn: bool = False):
+        suffix = self._build_name_suffix(info_dict)
+        if suffix or not info_dict.get("name_suffix"):
+            # 当前算出了后缀（信息已到齐），或此前还没有非空后缀（早期 incomplete 调用）→ 更新
+            # 用 None 而非空串：yt-dlp 模板对 None + 空默认值 %(...|)s 渲染为空，
+            # 空串会被它强制当成缺失字段（渲染成 NA）
+            info_dict["name_suffix"] = suffix
+        return super().prepare_filename(info_dict, dir_type, outtmpl=outtmpl, warn=warn)
 
 
 class DownloadWorker(QObject):
@@ -87,12 +133,16 @@ class DownloadWorker(QObject):
         self._saw_downloading = False
 
     def _write_log(self, msg: str) -> None:
+        # 每条日志加 [HH:MM:SS] 时间戳，便于排查时序问题
+        from datetime import datetime
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
         if self._log_file:
             try:
-                self._log_file.write(msg + "\n")
+                self._log_file.write(line + "\n")
             except Exception:
                 pass
-        self.log_message.emit(self.task_id, msg)
+        self.log_message.emit(self.task_id, line)
 
     def _progress_hook(self, d: dict[str, Any]) -> None:
         if self._is_cancelled:
@@ -178,14 +228,23 @@ class DownloadWorker(QObject):
             pass
 
         try:
-            # playlist 场景不能把具体 format_id 硬塞给 yt-dlp——各条目可能不一样。
-            # format_preset 是形如 "30126+30280" 的硬编码 id 时退回通用 selector。
+            # playlist 场景不能把裸 format_id（如 "30126+30280"）硬塞给 yt-dlp：
+            # 各分集 id 可能不同，某集缺失会整条任务失败。
+            # dialog 传来的特征 fallback 链（含 '/' 或 '['）已自带编码/分辨率意图和兜底，
+            # 必须原样透传——否则用户选普通 HEVC 会被通用 selector 换成杜比视界。
+            # 这里只兼容历史任务（DB 里存的裸 id spec）：追加一层通用兜底。
             effective_format = self.format_preset
-            if self.download_playlist and effective_format and "+" in effective_format:
-                effective_format = DEFAULT_FORMAT
+            if (
+                self.download_playlist
+                and effective_format
+                and "+" in effective_format
+                and "/" not in effective_format
+                and "[" not in effective_format
+            ):
+                effective_format = f"{effective_format}/{DEFAULT_FORMAT}"
                 self._write_log(
-                    "playlist 下载忽略具体 format_id（各条目格式 id 不同），"
-                    f"改用通用 selector: {effective_format}"
+                    "playlist 下载为具体 format_id 追加通用兜底 selector: "
+                    f"{effective_format}"
                 )
 
             base_options: Any = {
@@ -250,7 +309,48 @@ class DownloadWorker(QObject):
                 # 从本机指定浏览器导入 cookies（yt-dlp 原生支持）
                 # macOS 上 Chromium 系（chrome / edge / brave / arc）最稳，Safari 暂不支持
                 self._write_log(f"从浏览器导入 Cookies: {self.cookie_browser}")
-                base_options["cookiesfrombrowser"] = (self.cookie_browser,)
+                # 提前跑一次预检查：yt-dlp 在 cookiesfrombrowser 找不到用户数据时
+                # 会在内部 logger 打 ERROR 但继续跑（不崩），用户只看到两行神秘红字。
+                # 我们预跑 extract_cookies_from_browser，拿到它的 CookieLoadError
+                # 翻译成清晰提示，同时验证 cookies 能真读到。
+                try:
+                    from yt_dlp.cookies import extract_cookies_from_browser, SUPPORTED_BROWSERS
+                    if self.cookie_browser not in SUPPORTED_BROWSERS:
+                        self._write_log(f"⚠️ 浏览器 {self.cookie_browser} 不受 yt-dlp 支持，忽略 cookies")
+                        self.cookie_browser = None
+                    else:
+                        # extract_cookies_from_browser 会返回 CookieJar，
+                        # 也会自动解密 / 处理 keychain 等
+                        jar = extract_cookies_from_browser(
+                            self.cookie_browser,
+                            logger=self._SilentLogger(),
+                        )
+                        count = sum(1 for _ in jar)
+                        self._write_log(f"Extracted {count} cookies from {self.cookie_browser}")
+                        base_options["cookiesfrombrowser"] = (self.cookie_browser,)
+                except Exception as e:
+                    err_msg = str(e)
+                    # macOS 27+ 对 ~/Library/Application Support/<第三方浏览器> 目录加强了 TCC 权限控制：
+                    # 内层 Cookies 文件其实存在，但外层目录 listing 被拒绝
+                    # 报错关键词：Operation not permitted / could not find <browser> cookies
+                    is_macos_tcc = (
+                        sys.platform == "darwin"
+                        and ("Operation not permitted" in err_msg
+                             or "could not find" in err_msg)
+                    )
+                    self._write_log(f"⚠️ 无法从 {self.cookie_browser} 读取 cookies: {e}")
+                    if is_macos_tcc:
+                        self._write_log(
+                            "💡 macOS 权限提示: 新版 macOS 加强了浏览器数据目录保护。"
+                            "请到「系统设置 → 隐私与安全性 → 完全磁盘访问权限」"
+                            "把本 App（或 .venv/bin/python3）加进去，然后重启 App。"
+                        )
+                    else:
+                        self._write_log(
+                            "提示: 如果是首次安装浏览器，请先启动一次并登录 B 站账号；"
+                            "或到「高级设置」里改用 Chrome / Firefox。"
+                        )
+                    self.cookie_browser = None
 
             if self.ratelimit:
                 self._write_log(f"设置下载限速: {self.ratelimit}")
@@ -258,7 +358,7 @@ class DownloadWorker(QObject):
 
             base_options.update(self.ydl_opts)
 
-            with yt_dlp.YoutubeDL(base_options) as ydl:
+            with _GuidedNamingYoutubeDL(base_options) as ydl:
                 ydl.extract_info(self.url, download=True)
 
             if self._is_cancelled:
@@ -283,6 +383,15 @@ class DownloadWorker(QObject):
         if not self._is_cancelled:
             self._is_cancelled = True
             self._write_log("请求取消下载...")
+
+    class _SilentLogger:
+        """extract_cookies_from_browser 内部会调 logger 的多个方法，
+        我们不想让它的错误和我们自己的提示混在一起，所以用个静音 stub，
+        真正的失败由外层 except 捕获。"""
+        def debug(self, msg: str) -> None: ...  # noqa: E704
+        def info(self, msg: str) -> None: ...  # noqa: E704
+        def warning(self, msg: str) -> None: ...  # noqa: E704
+        def error(self, msg: str) -> None: ...  # noqa: E704
 
     class YtdlpLogger:
         """yt-dlp 日志记录器，过滤并转发日志消息"""

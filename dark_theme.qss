@@ -3,7 +3,8 @@
 QWidget {
     background-color: #1E1E1E;
     color: #E0E0E0;
-    font-family: "Inter", "PingFang SC", "Segoe UI", Arial, sans-serif;
+    /* 用各系统自带字体，避免 Qt 对缺失的 Inter 做字体别名映射（启动耗时 ~130ms） */
+    font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", "Noto Sans", Arial, sans-serif;
     font-size: 11pt;
 }
 

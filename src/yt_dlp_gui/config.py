@@ -17,28 +17,54 @@ from typing import Final
 # 默认下载格式
 DEFAULT_FORMAT: Final[str] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 
+# 非杜比兜底：用户明确选了非 DoVi 编码（HEVC/AVC/AV1 等）时，
+# 即使首选编码不可用也不能退化到杜比视界（dvhe/dvh1 在不支持的播放环境必然偏色）
+FALLBACK_FORMAT_NO_DOVI: Final[str] = (
+    'bestvideo[vcodec!~="(dvhe|dvh1)"][ext=mp4]+bestaudio[ext=m4a]/'
+    'bestvideo[vcodec!~="(dvhe|dvh1)"]+bestaudio/best'
+)
+
 # 输出文件名模板
-OUTPUT_TEMPLATE: Final[str] = "%(title)s [%(id)s].%(ext)s"
+# name_suffix 由 worker._GuidedNamingYoutubeDL 在文件名生成前注入：
+#   视频 → " [1080p avc1]"（分辨率+视频编码短名）；纯音频 → None
+# 纯音频时用 |  给空默认值，否则 yt-dlp 会把缺失字段渲染成 "NA"
+OUTPUT_TEMPLATE: Final[str] = "%(title)s%(name_suffix|)s.%(ext)s"
 
 # 格式预设选项（下拉菜单显示）
 # 每个格式都包含回退选项，避免特定编码器/分辨率不可用时失败
 # 注意：selector 字符串依赖 yt-dlp 每次解析视频时动态匹配，
 #       B 站的 format_id（如 30126/30280）不固定，千万别硬编码！
+# 杜比视界预设的名称常量——AddTaskDialog 用它做"仅 B 站链接显示"的过滤
+DOVI_PRESET_NAME: Final[str] = "杜比视界 (Dolby Vision)"
+
 FORMAT_PRESETS: Final[dict[str, str]] = {
     # --- 编码器偏好 ---
     "最佳质量 (任意编码)": "bestvideo+bestaudio/best",
     "最佳质量 (MP4,任意编码)": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+    # 杜比视界：仅 B 站链接显示（AddTaskDialog 按 URL 过滤）。
+    # 故意不挂非 DoVi 的通用兜底——选这项就是要杜比，下成普通流反而误导，
+    # 视频没有 DoVi 轨时让 yt-dlp 直接报"格式不可用"更明确
+    "杜比视界 (Dolby Vision)": (
+        'bestvideo[vcodec~="(dvhe|dvh1)"][ext=mp4]+bestaudio[acodec*=mp4a][ext=m4a]/'
+        'bestvideo[vcodec~="(dvhe|dvh1)"]+bestaudio'
+    ),
     "最佳 AV1 (mp4+m4a)": (
         "bestvideo[vcodec*=av01][ext=mp4]+bestaudio[acodec*=mp4a][ext=m4a]/"
-        "bestvideo[vcodec*=av01]+bestaudio/bestvideo+bestaudio/best"
+        "bestvideo[vcodec*=av01]+bestaudio/"
+        + FALLBACK_FORMAT_NO_DOVI
     ),
+    # HEVC 家族在不同平台上报 hev1（B站普通 HEVC）或 hvc1（YouTube/MP4 标注），
+    # 用正则同时覆盖；(hev1|hvc1) 天然不匹配 dvhe/dvh1，不会误选杜比视界。
+    # 注意兜底级也必须显式排除 dvhe/dvh1——HEVC 流不可用时裸 bestvideo 会选到杜比轨
     "最佳 HEVC/h265 (mp4+m4a)": (
-        "bestvideo[vcodec*=hvc1][ext=mp4]+bestaudio[acodec*=mp4a][ext=m4a]/"
-        "bestvideo[vcodec*=hvc1]+bestaudio/bestvideo+bestaudio/best"
+        'bestvideo[vcodec~="(hev1|hvc1)"][ext=mp4]+bestaudio[acodec*=mp4a][ext=m4a]/'
+        'bestvideo[vcodec~="(hev1|hvc1)"]+bestaudio/'
+        + FALLBACK_FORMAT_NO_DOVI
     ),
     "最佳 H.264/AVC (mp4+m4a)": (
         "bestvideo[vcodec*=avc1][ext=mp4]+bestaudio[acodec*=mp4a][ext=m4a]/"
-        "bestvideo[vcodec*=avc1]+bestaudio/bestvideo+bestaudio/best"
+        "bestvideo[vcodec*=avc1]+bestaudio/"
+        + FALLBACK_FORMAT_NO_DOVI
     ),
     # --- 分辨率偏好（任意编码）---
     "4K (≤2160p)": "bestvideo[height<=2160]+bestaudio/bestvideo+bestaudio/best",

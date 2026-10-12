@@ -31,41 +31,265 @@ from PySide6.QtWidgets import (
 )
 
 from .components import Switch
-from .config import FORMAT_PRESETS, get_last_save_path, load_ui_state, save_ui_state
+from .config import DEFAULT_FORMAT, DOVI_PRESET_NAME, FALLBACK_FORMAT_NO_DOVI, FORMAT_PRESETS, get_last_save_path, load_ui_state, save_ui_state
 from .models import DownloadTask
 
 
 class LogDialog(QDialog):
+    """任务日志对话框 —— 带富文本着色 / 搜索 / 自动滚动 / 导出"""
+
+    # 着色规则：(regex, CSS color)，按顺序匹配
+    # 注意：Qt QTextEdit 不支持 span 里嵌套 span，所以一条日志只能有一个主颜色
+    _COLOR_RULES: list[tuple[str, str]] = [
+        # 错误类 — 红色
+        (r"(?i)错误:|\[ERROR\]|Traceback|Exception|^ERROR|失败|失败|失败:", "#FF6B6B"),
+        # 警告类 — 黄色
+        (r"(?i)警告:|\[WARN|\[warning|WARNING|⚠️|⚠ | 警告", "#FFD93D"),
+        # ffmpeg 合并 — 青绿
+        (r"(?i)\[ffmpeg\]|合并|merg", "#4ECDC4"),
+        # 弹幕 — 紫色
+        (r"(?i)弹幕|danmaku|danmu", "#A78BFA"),
+        # yt-dlp info / download / extractor 标签 — 灰色（降低视觉权重）
+        (r"^\[[A-Za-z_]+\] ", "#9AA0A6"),
+        # 业务高亮（我们自己写的关键动作）— 淡绿
+        (r"下载完成|开始下载|跳过下载|开始合并|合并完成|正在中断|请求取消", "#86EFAC"),
+    ]
+
     def __init__(self, task_id, title, parent=None):
         super().__init__(parent)
         self.task_id = task_id
         self.setWindowTitle(f"任务日志 - {title}")
-        self.resize(700, 500)
+        self.resize(820, 560)
+        self._auto_scroll = True
         self._setup_ui()
 
     def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        self.log_output = QPlainTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setMaximumBlockCount(2000)
-        self.log_output.setFont(QFont("Courier New", 10) if os.name == "nt" else QFont("Menlo", 10))
-        self.log_output.setStyleSheet(
-            "background-color: #0F0F0F; color: #FFFFFF; border: 1px solid #000000; border-radius: 3px;"
-        )
-        layout.addWidget(self.log_output)
+        root = QVBoxLayout(self)
 
+        # ---- 工具栏 ----
+        toolbar = QHBoxLayout()
+        toolbar.setContentsMargins(4, 4, 4, 0)
+
+        # 搜索框
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("🔍 搜索日志...")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._on_search_changed)
+        toolbar.addWidget(self.search_edit, 1)
+
+        # 自动滚动开关
+        self.auto_scroll_btn = QPushButton("⏸ 暂停跟随")
+        self.auto_scroll_btn.setCheckable(True)
+        self.auto_scroll_btn.setChecked(True)
+        self.auto_scroll_btn.clicked.connect(self._toggle_auto_scroll)
+        self.auto_scroll_btn.setToolTip("关闭后手动往上翻看历史，新日志不再自动拉到底")
+        toolbar.addWidget(self.auto_scroll_btn)
+
+        # 自动换行开关
+        self.wrap_btn = QPushButton("📜 换行")
+        self.wrap_btn.setCheckable(True)
+        self.wrap_btn.clicked.connect(self._toggle_wrap)
+        self.wrap_btn.setToolTip("切换自动换行/水平滚动")
+        toolbar.addWidget(self.wrap_btn)
+
+        toolbar.addSpacing(8)
+
+        # 操作按钮
+        copy_btn = QPushButton("📋 复制全部")
+        copy_btn.clicked.connect(self._copy_all)
+        toolbar.addWidget(copy_btn)
+
+        export_btn = QPushButton("📁 导出")
+        export_btn.clicked.connect(self._export_to_file)
+        toolbar.addWidget(export_btn)
+
+        clear_btn = QPushButton("🗑 清空")
+        clear_btn.clicked.connect(self._clear)
+        toolbar.addWidget(clear_btn)
+
+        root.addLayout(toolbar)
+
+        # ---- 日志主体 ----
+        from PySide6.QtWidgets import QTextEdit
+        from PySide6.QtGui import QTextCursor, QTextDocument
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.log_output.setFont(
+            QFont("Menlo", 10)
+            if os.name != "nt"
+            else QFont("Consolas", 10)
+        )
+        self.log_output.setStyleSheet(
+            "QTextEdit { background-color: #0D1117; color: #E6EDF3; "
+            "border: 1px solid #30363D; border-radius: 4px; padding: 6px; }"
+        )
+        # 用户手动滚动时，根据是否在底部更新自动跟随状态
+        sb = self.log_output.verticalScrollBar()
+        sb.valueChanged.connect(self._on_scroll_changed)
+
+        root.addWidget(self.log_output, 1)
+
+        # ---- 底部：状态 + 关闭 ----
+        footer = QHBoxLayout()
+        self.status_label = QLabel("0 行")
+        self.status_label.setStyleSheet("color: #8B949E; font-size: 11px;")
+        footer.addWidget(self.status_label)
+        footer.addStretch()
         btn_close = QPushButton("关闭")
         btn_close.clicked.connect(self.close)
-        layout.addWidget(btn_close)
+        footer.addWidget(btn_close)
+        root.addLayout(footer)
 
-    def append_log(self, message):
-        self.log_output.appendPlainText(message)
-        # 自动滚动到底部
-        self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
+    # ---- 着色 ----
+    @classmethod
+    def _colorize(cls, line: str) -> str:
+        """把一行日志包成带颜色的 HTML span。"""
+        color = "#E6EDF3"  # 默认：浅色
+        for pattern, c in cls._COLOR_RULES:
+            if re.search(pattern, line):
+                color = c
+                break
+        # 转义 HTML 特殊字符，但保留原始空格（用 &nbsp; 或 CSS white-space）
+        safe = (
+            line.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+        return f'<span style="color:{color};white-space:pre">{safe}</span>'
 
-    def set_initial_logs(self, logs):
-        self.log_output.setPlainText(logs)
-        self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
+    # ---- 追加 / 初始化 ----
+    def append_log(self, message: str):
+        from PySide6.QtGui import QTextCursor
+        html_line = self._colorize(message)
+        cursor = self.log_output.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        # 先显式切一个新段落 block —— 这是 Qt 保证创建新 block 的唯一可靠方式
+        # （insertHtml("<p>..") 在已有段落末尾会被降级成 inline 插入）
+        cursor.insertBlock()
+        cursor.insertHtml(html_line)
+        self.log_output.setTextCursor(cursor)
+        self._update_status()
+        if self._auto_scroll:
+            sb = self.log_output.verticalScrollBar()
+            sb.setValue(sb.maximum())
+
+    def set_initial_logs(self, logs: str):
+        """首次打开时批量载入 —— 每行独立 <p>，Qt 会自动分 block"""
+        lines = logs.rstrip("\n").split("\n") if logs.strip() else []
+        if not lines:
+            self.log_output.clear()
+            self._update_status()
+            return
+        paras = [f"<p>{self._colorize(ln)}</p>" for ln in lines]
+        html_doc = (
+            '<div style="font-family:Menlo,Consolas,monospace;font-size:12px;'
+            'background-color:#0D1117;padding:4px">'
+            + "".join(paras)
+            + "</div>"
+        )
+        self.log_output.setHtml(html_doc)
+        sb = self.log_output.verticalScrollBar()
+        sb.setValue(sb.maximum())
+        self._update_status()
+
+    # ---- 工具栏动作 ----
+    def _toggle_auto_scroll(self):
+        self._auto_scroll = self.auto_scroll_btn.isChecked()
+        self.auto_scroll_btn.setText("⏸ 暂停跟随" if self._auto_scroll else "▶ 跟随到底")
+        if self._auto_scroll:
+            sb = self.log_output.verticalScrollBar()
+            sb.setValue(sb.maximum())
+
+    def _on_scroll_changed(self, value: int):
+        """用户手动滚动 —— 到底部时恢复自动跟随，否则暂停"""
+        sb = self.log_output.verticalScrollBar()
+        at_bottom = value >= sb.maximum() - 2
+        if at_bottom and not self._auto_scroll:
+            self._auto_scroll = True
+            self.auto_scroll_btn.setChecked(True)
+            self.auto_scroll_btn.setText("⏸ 暂停跟随")
+        elif not at_bottom and self._auto_scroll:
+            self._auto_scroll = False
+            self.auto_scroll_btn.setChecked(False)
+            self.auto_scroll_btn.setText("▶ 跟随到底")
+
+    def _toggle_wrap(self):
+        from PySide6.QtWidgets import QTextEdit
+        wrap = self.wrap_btn.isChecked()
+        self.wrap_btn.setText("📜 换行" if wrap else "📜 长行")
+        self.log_output.setLineWrapMode(
+            QTextEdit.LineWrapMode.WidgetWidth if wrap
+            else QTextEdit.LineWrapMode.NoWrap
+        )
+
+    def _on_search_changed(self, text: str):
+        """搜索：高亮所有匹配行 + 状态栏显示计数"""
+        from PySide6.QtGui import QTextCursor, QTextCharFormat
+        doc = self.log_output.document()
+        highlight_fmt = QTextCharFormat()
+        highlight_fmt.setBackground(QColor("#4C2A8F"))
+        highlight_fmt.setForeground(QColor("#FFFFFF"))
+        default_fmt = QTextCharFormat()
+        # 先清掉上次的高亮
+        cursor = QTextCursor(doc)
+        while True:
+            cursor = doc.find(text, cursor)
+            if cursor.isNull():
+                break
+            cursor.mergeCharFormat(default_fmt)
+            # 挪到匹配末尾，继续搜
+            end = cursor.selectionEnd()
+            cursor = QTextCursor(doc)
+            cursor.setPosition(end)
+        # 重新高亮
+        count = 0
+        if text.strip():
+            cursor = QTextCursor(doc)
+            while True:
+                cursor = doc.find(text, cursor)
+                if cursor.isNull():
+                    break
+                cursor.mergeCharFormat(highlight_fmt)
+                count += 1
+                end = cursor.selectionEnd()
+                cursor = QTextCursor(doc)
+                cursor.setPosition(end)
+        if text.strip():
+            self.status_label.setText(f"{self._line_count()} 行 · 匹配 {count}")
+        else:
+            self._update_status()
+
+    def _line_count(self) -> int:
+        """blockCount 在 <p> 模式下 = 实际行数 + 1（末尾空 block）"""
+        return max(0, self.log_output.document().blockCount() - 1)
+
+    def _copy_all(self):
+        QApplication.clipboard().setText(self.log_output.toPlainText())
+        self.status_label.setText(f"已复制到剪贴板 · {self._line_count()} 行")
+
+    def _export_to_file(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出任务日志", f"task_{self.task_id}.log", "日志文件 (*.log);;文本文件 (*.txt)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.log_output.toPlainText())
+            self.status_label.setText(f"已导出到 {path}")
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
+
+    def _clear(self):
+        self.log_output.clear()
+        self._update_status()
+
+    # ---- 辅助 ----
+    def _update_status(self):
+        sb = self.log_output.verticalScrollBar()
+        bottom = "（跟随中）" if self._auto_scroll else "（已暂停）"
+        self.status_label.setText(f"{self._line_count()} 行 {bottom}")
 
 
 class FormatPreviewWorker(QObject):
@@ -204,6 +428,150 @@ def _shrink_info(info: Any) -> None:
             _shrink_info(item)
 
 
+FORMAT_HELP_HTML: str = """
+<div style="font-family:Menlo,Consolas,monospace;font-size:12px;color:#E6EDF3;line-height:1.55;">
+
+<h3 style="margin:0 0 6px 0;color:#58A6FF;">🎬 视频编码对照表（vcodec 列）</h3>
+
+<table cellspacing="0" cellpadding="4" style="width:100%;border-collapse:collapse;margin-bottom:10px;">
+<tr style="background:#161B22;">
+<td style="border-bottom:1px solid #30363D;color:#FF7B72;"><b>编码</b></td>
+<td style="border-bottom:1px solid #30363D;color:#E6EDF3;"><b>全称 / 中文名</b></td>
+<td style="border-bottom:1px solid #30363D;color:#E6EDF3;"><b>同画质体积</b></td>
+<td style="border-bottom:1px solid #30363D;color:#E6EDF3;"><b>兼容 / 备注</b></td>
+<td style="border-bottom:1px solid #30363D;color:#86EFAC;"><b>推荐场景</b></td>
+</tr>
+<tr>
+<td style="border-bottom:1px solid #21262D;color:#FFA657;">avc1 / h264</td>
+<td style="border-bottom:1px solid #21262D;">H.264 / AVC</td>
+<td style="border-bottom:1px solid #21262D;">基准 (100%)</td>
+<td style="border-bottom:1px solid #21262D;">⭐⭐⭐⭐⭐ 全平台</td>
+<td style="border-bottom:1px solid #21262D;">通用、老设备兼容优先</td>
+</tr>
+<tr>
+<td style="border-bottom:1px solid #21262D;color:#D2A8FF;">hvc1 / hevc</td>
+<td style="border-bottom:1px solid #21262D;">H.265 / HEVC</td>
+<td style="border-bottom:1px solid #21262D;">↓35%</td>
+<td style="border-bottom:1px solid #21262D;">⭐⭐⭐ 主流播放</td>
+<td style="border-bottom:1px solid #21262D;">体积更小、画质相当</td>
+</tr>
+<tr>
+<td style="border-bottom:1px solid #21262D;color:#FFD93D;"><b>dvhe / dvh1</b></td>
+<td style="border-bottom:1px solid #21262D;">H.265 + <b>杜比视界</b><br>(Dolby Vision)</td>
+<td style="border-bottom:1px solid #21262D;">同 HEVC</td>
+<td style="border-bottom:1px solid #21262D;">⭐⭐ 需支持杜比视界的<br>播放设备/软件</td>
+<td style="border-bottom:1px solid #21262D;">B 站大会员 4K 常见<br>（轨表带 ★杜比）</td>
+</tr>
+<tr>
+<td style="border-bottom:1px solid #21262D;color:#A5D6FF;"><b>av01</b></td>
+<td style="border-bottom:1px solid #21262D;">AV1（AOMedia Video 1）</td>
+<td style="border-bottom:1px solid #21262D;"><b>↓50%</b></td>
+<td style="border-bottom:1px solid #21262D;">⭐⭐⭐ Mac 需 M1+ / macOS 13+ 硬解</td>
+<td style="border-bottom:1px solid #21262D;"><b>归档首选</b>，体积最小</td>
+</tr>
+<tr>
+<td style="border-bottom:1px solid #21262D;color:#79C0FF;">vp09</td>
+<td style="border-bottom:1px solid #21262D;">VP9</td>
+<td style="border-bottom:1px solid #21262D;">↓25%</td>
+<td style="border-bottom:1px solid #21262D;">Chrome 系好</td>
+<td style="border-bottom:1px solid #21262D;">YouTube 平台</td>
+</tr>
+</table>
+
+<p style="margin:0 0 10px 0;padding:8px 10px;background:#161B22;border-left:3px solid #FFD93D;border-radius:3px;color:#C9D1D9;">
+<b style="color:#FFD93D;">🌟 关于 dvhe / dvh1（杜比视界）</b><br>
+本质上仍是 H.265/HEVC 码流，只是额外携带了一层 <b>RPU 动态元数据</b>（逐帧的亮度/色彩映射信息），所以体积和同规格 HEVC 基本一样。<br>
+<b>播放环境不支持杜比视界时，RPU 被忽略，画面会按错误色域渲染（发绿 / 发紫 / 泛灰）</b>——这不是文件损坏。没有杜比视界显示设备或把握不准播放环境时，直接选不带 ★杜比 的 hev1 / hvc1 轨即可。
+</p>
+
+<h3 style="margin:8px 0 6px 0;color:#58A6FF;">🔊 音频编码（acodec 列）</h3>
+
+<table cellspacing="0" cellpadding="4" style="width:100%;border-collapse:collapse;margin-bottom:10px;">
+<tr style="background:#161B22;">
+<td style="border-bottom:1px solid #30363D;color:#FF7B72;"><b>编码</b></td>
+<td style="border-bottom:1px solid #30363D;color:#E6EDF3;"><b>中文名</b></td>
+<td style="border-bottom:1px solid #30363D;color:#E6EDF3;"><b>备注</b></td>
+</tr>
+<tr>
+<td style="border-bottom:1px solid #21262D;color:#7EE787;"><b>mp4a.40.2</b></td>
+<td style="border-bottom:1px solid #21262D;">AAC-LC</td>
+<td style="border-bottom:1px solid #21262D;"><b>B 站唯一音轨</b>。128kbps 已是最佳选择，再高听不到区别</td>
+</tr>
+<tr>
+<td style="border-bottom:1px solid #21262D;color:#C9B3FF;">mp4a.40.5</td>
+<td style="border-bottom:1px solid #21262D;">HE-AAC v2</td>
+<td style="border-bottom:1px solid #21262D;">高效 AAC，23.9kbps 抵 AAC-LC 64kbps（B 站不用）</td>
+</tr>
+<tr>
+<td style="border-bottom:1px solid #21262D;color:#E6EDF3;">opus</td>
+<td style="border-bottom:1px solid #21262D;">Opus</td>
+<td style="border-bottom:1px solid #21262D;">YouTube 常用，低码率音质更好</td>
+</tr>
+</table>
+
+<h3 style="margin:8px 0 6px 0;color:#58A6FF;">📦 容器 ext（文件后缀）</h3>
+
+<table cellspacing="0" cellpadding="4" style="width:100%;border-collapse:collapse;margin-bottom:10px;">
+<tr style="background:#161B22;">
+<td style="border-bottom:1px solid #30363D;color:#FF7B72;"><b>ext</b></td>
+<td style="border-bottom:1px solid #30363D;color:#E6EDF3;"><b>容器</b></td>
+<td style="border-bottom:1px solid #30363D;color:#86EFAC;"><b>说明</b></td>
+</tr>
+<tr>
+<td style="border-bottom:1px solid #21262D;color:#7EE787;"><b>mp4</b></td>
+<td style="border-bottom:1px solid #21262D;">MP4</td>
+<td style="border-bottom:1px solid #21262D;"><b>B 站唯一容器</b>。最通用，全设备播放</td>
+</tr>
+<tr>
+<td style="border-bottom:1px solid #21262D;color:#E6EDF3;">m4a</td>
+<td style="border-bottom:1px solid #21262D;">M4A</td>
+<td style="border-bottom:1px solid #21262D;">B 站音轨格式；ffmpeg 合成 mp4 时无损 remux 进去</td>
+</tr>
+<tr>
+<td style="border-bottom:1px solid #21262D;color:#E6EDF3;">webm</td>
+<td style="border-bottom:1px solid #21262D;">WebM</td>
+<td style="border-bottom:1px solid #21262D;">YouTube 常用，Chrome 原生支持好</td>
+</tr>
+</table>
+
+<h3 style="margin:8px 0 6px 0;color:#58A6FF;"> 怎么选？推荐组合</h3>
+
+<table cellspacing="0" cellpadding="4" style="width:100%;border-collapse:collapse;">
+<tr style="background:#161B22;">
+<td style="border-bottom:1px solid #30363D;color:#FF7B72;"><b>需求</b></td>
+<td style="border-bottom:1px solid #30363D;color:#E6EDF3;"><b>选 编码</b></td>
+<td style="border-bottom:1px solid #30363D;color:#E6EDF3;"><b>选 分辨率</b></td>
+<td style="border-bottom:1px solid #30363D;color:#86EFAC;"><b>理由</b></td>
+</tr>
+<tr>
+<td style="border-bottom:1px solid #21262D;">体积最小</td>
+<td style="border-bottom:1px solid #21262D;color:#A5D6FF;"><b>av01</b></td>
+<td style="border-bottom:1px solid #21262D;">最高可用</td>
+<td style="border-bottom:1px solid #21262D;">体积比 H.264 小一半</td>
+</tr>
+<tr>
+<td style="border-bottom:1px solid #21262D;">均衡推荐</td>
+<td style="border-bottom:1px solid #21262D;color:#D2A8FF;"><b>hvc1</b></td>
+<td style="border-bottom:1px solid #21262D;">1080p</td>
+<td style="border-bottom:1px solid #21262D;">体积 -35%，画质差不多</td>
+</tr>
+<tr>
+<td style="border-bottom:1px solid #21262D;">最稳兼容</td>
+<td style="border-bottom:1px solid #21262D;color:#FFA657;"><b>avc1</b></td>
+<td style="border-bottom:1px solid #21262D;">1080p</td>
+<td style="border-bottom:1px solid #21262D;">编码快，全设备无压力</td>
+</tr>
+<tr>
+<td style="border-bottom:1px solid #21262D;">动作流畅</td>
+<td style="border-bottom:1px solid #21262D;">任一</td>
+<td style="border-bottom:1px solid #21262D;"><b>60fps</b></td>
+<td style="border-bottom:1px solid #21262D;">运动/动作番剧观感翻倍</td>
+</tr>
+</table>
+</div>
+"""
+
+
 class FormatPreviewDialog(QDialog):
     """格式预览对话框：播放列表时顶部让用户勾选条目，底部让用户挑视频+音频轨道"""
 
@@ -314,13 +682,33 @@ class FormatPreviewDialog(QDialog):
         grid.addWidget(self.audio_table, 1, 1)
         layout.addLayout(grid, 1)
 
-        tip = QLabel(
-            "提示：<b>杜比视界 (DoVi) / HDR / AV1 (av01)</b> 在 Mac 上需要 macOS 13+ 和 Apple Silicon 硬解，"
-            "Intel Mac 会黑屏。视频和音频可以自由组合。"
+        # ====== 格式帮助面板 ======
+        # 默认收起，点标题展开；字体稍小 + GitHub Dark 配色跟日志面板呼应
+        from PySide6.QtWidgets import QTextBrowser
+        from PySide6.QtGui import QFont
+
+        help_toggle = QLabel(
+            '<span style="color:#8B949E;">💡 <a href="show_format_help" style="color:#58A6FF;">'
+            '看不懂 avc1 / hvc1 / dvhe / av01？展开格式字典 ▾</a></span>'
         )
-        tip.setStyleSheet("color: #AAA; font-size: 11px;")
-        tip.setWordWrap(True)
-        layout.addWidget(tip)
+        help_toggle.setOpenExternalLinks(False)
+        help_toggle.linkActivated.connect(lambda _: self._toggle_format_help(True))
+        self._help_toggle = help_toggle
+        layout.addWidget(help_toggle)
+
+        self._help_browser = QTextBrowser()
+        self._help_browser.setOpenExternalLinks(True)
+        self._help_browser.setFont(
+            QFont("Menlo", 10) if os.name != "nt" else QFont("Consolas", 10)
+        )
+        self._help_browser.setStyleSheet(
+            "QTextBrowser { background-color: #0D1117; color: #E6EDF3; "
+            "border: 1px solid #30363D; border-radius: 4px; padding: 8px; }"
+        )
+        self._help_browser.setHtml(FORMAT_HELP_HTML)
+        self._help_browser.setFixedHeight(0)  # 默认收起
+        self._help_browser.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        layout.addWidget(self._help_browser)
 
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -333,6 +721,24 @@ class FormatPreviewDialog(QDialog):
 
         self._btns = btns
         self._update_ok_enabled()
+
+    def _toggle_format_help(self, show: bool | None = None) -> None:
+        """展开/收起格式帮助面板"""
+        if show is None:
+            show = self._help_browser.height() == 0
+        self._help_browser.setFixedHeight(320 if show else 0)
+        if show:
+            self._help_toggle.setText(
+                '<span style="color:#8B949E;">💡 <a href="hide_format_help" style="color:#58A6FF;">'
+                '收起格式字典 ▴</a></span>'
+            )
+            self._help_toggle.linkActivated.connect(lambda _: self._toggle_format_help(False))
+        else:
+            self._help_toggle.setText(
+                '<span style="color:#8B949E;">💡 <a href="show_format_help" style="color:#58A6FF;">'
+                '看不懂 avc1 / hvc1 / dvhe / av01？展开格式字典 ▾</a></span>'
+            )
+            self._help_toggle.linkActivated.connect(lambda _: self._toggle_format_help(True))
 
     def _make_format_table(self, kind: str = "video") -> QTableWidget:
         """轨道表。kind='video' 显示分辨率/帧率，kind='audio' 显示采样率/码率"""
@@ -666,6 +1072,11 @@ class FormatPreviewDialog(QDialog):
         self.video_table.itemSelectionChanged.connect(self._update_ok_enabled)
         self.audio_table.itemSelectionChanged.connect(self._update_ok_enabled)
 
+        # 音轨默认选中最高码率那条（audios 已按 abr 降序，第 0 行即最佳）；
+        # 视频轨保持不选，强制用户确认分辨率/DoVi，避免误下超大文件
+        if self.audio_table.rowCount() > 0:
+            self.audio_table.selectRow(0)
+
     # ---------- 选行 ----------
     def _selected_format_id(self, table: QTableWidget) -> Optional[str]:
         row = table.currentRow()
@@ -709,23 +1120,77 @@ class FormatPreviewDialog(QDialog):
             return f"{self.video_format_id}+{self.audio_format_id}"
         return ""
 
+    def _find_format(self, fid: Optional[str]) -> Optional[dict[str, Any]]:
+        """按 format_id 在本次展示的格式列表里找回原始 format dict"""
+        if not fid:
+            return None
+        for f in self._formats:
+            if str(f.get("format_id")) == fid:
+                return f
+        return None
+
+    # 同一编码在不同容器/平台上报的 FourCC 互通家族
+    # （selector 正则值含 | 时必须用双引号包裹，见 yt-dlp YoutubeDL.py L2242）
+    _CODEC_FAMILY_PATTERNS: dict[str, str] = {
+        "hev1": r"(hev1|hvc1)",
+        "hvc1": r"(hev1|hvc1)",
+        "dvhe": r"(dvhe|dvh1)",
+        "dvh1": r"(dvhe|dvh1)",
+    }
+
+    def get_playlist_format_spec(self) -> str:
+        """playlist 场景的 format spec：保留选轨的编码/分辨率意图，但不硬绑 format_id。
+
+        各分集 format_id 可能不同（甚至缺失），所以按优先级组成 '/' fallback 链：
+          1. 用户选的原始 id 对（B站番剧各集 id 通常一致，命中最精确）
+          2. 同编码家族 + 同分辨率 + 同容器
+          3. 同编码家族 + 同容器
+          4. 同编码家族（任意容器）
+          5. 尾级兜底：非杜比轨用排除 dvhe/dvh1 的兜底，杜比轨才用通用兜底
+        yt-dlp 对 '/' 候选按分集逐个尝试：id 在某集不存在时自动落到特征候选，
+        因此选了普通 HEVC（hev1）绝不会误选杜比视界（dvhe/dvh1）。
+        """
+        id_spec = self.get_format_spec()
+        vid = self._find_format(self.video_format_id)
+        if not vid:
+            return id_spec or DEFAULT_FORMAT
+        prefix = str(vid.get("vcodec") or "").split(".")[0].lower()
+        family = self._CODEC_FAMILY_PATTERNS.get(prefix, prefix)  # avc1/av01/vp09 直接用
+        if not family:
+            # 少数预合成流（如 B站番剧预览 format 32）不报 vcodec → 只保留 id + 通用兜底
+            return f"{id_spec}/{DEFAULT_FORMAT}" if id_spec else DEFAULT_FORMAT
+
+        is_dovi_choice = prefix in ("dvhe", "dvh1")
+        height = vid.get("height")
+        vext = vid.get("ext") or "mp4"
+        aid = self._find_format(self.audio_format_id)
+        aext = (aid.get("ext") if aid else "") or "m4a"
+
+        candidates: list[str] = []
+        if id_spec:
+            candidates.append(id_spec)
+        v_levels: list[str] = []
+        if height:
+            v_levels.append(f'bestvideo[vcodec~="{family}"][height={height}][ext={vext}]')
+        v_levels.append(f'bestvideo[vcodec~="{family}"][ext={vext}]')
+        v_levels.append(f'bestvideo[vcodec~="{family}"]')
+        # 每级展开两条完整合并候选，避免 'v+bestaudio[ext=x]/bestaudio'
+        # 被解析成 (v+bestaudio[ext=x])/bestaudio
+        for v in v_levels:
+            candidates.append(f"{v}+bestaudio[ext={aext}]")
+            candidates.append(f"{v}+bestaudio")
+        # 选的是非杜比轨时，尾级兜底也排除杜比视界，防止该编码在某分集缺失时滑到 dvhe
+        candidates.append(DEFAULT_FORMAT if is_dovi_choice else FALLBACK_FORMAT_NO_DOVI)
+        return "/".join(candidates)
+
     def get_playlist_items_str(self) -> Optional[str]:
         """给 yt-dlp --playlist-items 用的字符串，例如 '1,3-5,8'；None = 全部"""
         return self._playlist_items_str
 
     def get_human_label(self) -> str:
         """给用户看的人类可读标签，例如 'DoVi 3840x2160 HEVC / AAC 192kbps'"""
-
-        def _find(fid: Optional[str]) -> Optional[dict]:
-            if not fid:
-                return None
-            for f in self._formats:
-                if str(f.get("format_id")) == fid:
-                    return f
-            return None
-
-        vid = _find(self.video_format_id)
-        aid = _find(self.audio_format_id)
+        vid = self._find_format(self.video_format_id)
+        aid = self._find_format(self.audio_format_id)
         if not vid or not aid:
             return self.get_format_spec()
         res = vid.get("resolution") or f"{vid.get('width', '')}x{vid.get('height', '')}"
@@ -746,6 +1211,7 @@ class AddTaskDialog(QDialog):
         # 用上次保存目录，没有则回退到系统下载目录
         self.selected_download_path = get_last_save_path()
         self._format_spec: str = ""  # 用户手动选的 format_id+format_id
+        self._playlist_format_spec: str = ""  # playlist 用：id 首选 + 编码特征 fallback 链
         self._format_human_label: str = ""  # 显示给用户看的格式描述
         self._playlist_items_str: Optional[str] = None  # FormatPreviewDialog 返回的勾选压缩串
         self._parse_thread: Optional[QThread] = None
@@ -778,6 +1244,7 @@ class AddTaskDialog(QDialog):
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("粘贴视频链接...")
         self.url_input.returnPressed.connect(self._on_parse_clicked)
+        self.url_input.textChanged.connect(self._on_url_text_changed)
         url_row.addWidget(self.url_input, 1)
         self.parse_btn = QPushButton(qta.icon("fa5s.list-alt", color="#FFFFFF"), "  解析格式")
         self.parse_btn.setMinimumWidth(120)
@@ -800,7 +1267,8 @@ class AddTaskDialog(QDialog):
         self.format_combo = QComboBox()
         self.format_combo.setView(QListView())
         # 初始只放 preset 选项，解析后如果用户选了具体 format_id 会在头部插入"已选具体格式"项
-        self._format_preset_items = list(FORMAT_PRESETS.keys())
+        # 杜比视界预设仅 B 站链接显示（URL 变化时 _on_url_text_changed 会重建列表）
+        self._format_preset_items = self._preset_items_for_url(self.url_input.text())
         self.format_combo.addItems(self._format_preset_items)
 
         options_layout.addWidget(QLabel("下载格式:"), 0, 0)
@@ -1006,6 +1474,7 @@ class AddTaskDialog(QDialog):
         dlg = FormatPreviewDialog(info, parent=self)
         if dlg.exec():
             self._format_spec = dlg.get_format_spec()
+            self._playlist_format_spec = dlg.get_playlist_format_spec()
             self._format_human_label = dlg.get_human_label()
             self._last_url_for_parse = info.get("webpage_url") or self.url_input.text()
             # 自动把勾选项转成 playlist_items 字符串塞进文本框
@@ -1029,6 +1498,38 @@ class AddTaskDialog(QDialog):
             self.format_combo.addItem(display, userData=self._format_spec)
         self.format_combo.addItems(self._format_preset_items)
         self.format_combo.setCurrentIndex(0 if self._format_spec else 1)
+        self.format_combo.blockSignals(False)
+
+    @staticmethod
+    def _preset_items_for_url(url: str) -> list[str]:
+        """按 URL 过滤预设：杜比视界轨只有 B 站提供，其他平台不显示该项"""
+        items = list(FORMAT_PRESETS.keys())
+        if "bilibili.com" not in url.lower():
+            items = [i for i in items if i != DOVI_PRESET_NAME]
+        return items
+
+    @Slot(str)
+    def _on_url_text_changed(self, _text: str) -> None:
+        """URL 变化时重建预设列表（杜比视界项随 B 站链接显隐），尽量保留当前选中"""
+        new_items = self._preset_items_for_url(self.url_input.text())
+        if new_items == self._format_preset_items:
+            return
+        # combo 头部可能有解析后插入的"已选：..."项（带 userData），重建时保留
+        head: list[tuple[str, Any]] = []
+        if self._format_spec and self.format_combo.count() > len(self._format_preset_items):
+            head.append((self.format_combo.itemText(0), self.format_combo.itemData(0)))
+        prev_text = self.format_combo.currentText()
+        self.format_combo.blockSignals(True)
+        self.format_combo.clear()
+        for text, data in head:
+            self.format_combo.addItem(text, userData=data)
+        self.format_combo.addItems(new_items)
+        self._format_preset_items = new_items
+        if head:
+            self.format_combo.setCurrentIndex(0)
+        else:
+            idx = self.format_combo.findText(prev_text)
+            self.format_combo.setCurrentIndex(max(idx, 0))
         self.format_combo.blockSignals(False)
 
     @Slot(str)
@@ -1070,17 +1571,24 @@ class AddTaskDialog(QDialog):
             cookie_browser_val = None
 
         # format 取值优先级：
+        #   playlist → 特征 fallback 链（id 首选 + 同编码/分辨率候选），
+        #              避免各分集 id 不同被通用 selector 换成别的编码（如选 hev1 却下到 dvhe）
+        #   单视频：
         #   1) combo 里通过 userData 塞的"已选：..."项（具体 format_id+format_id）
         #   2) _format_spec 字段（预览框返回）
         #   3) preset 下拉名字（走 config.py 里的 FORMAT_PRESETS 映射）
-        fmt_data = self.format_combo.currentData()
-        if isinstance(fmt_data, str) and "+" in fmt_data:
-            format_preset = fmt_data
-        elif self._format_spec:
-            format_preset = self._format_spec
+        is_playlist = self.download_playlist_checkbox.isChecked()
+        if is_playlist and self._playlist_format_spec:
+            format_preset = self._playlist_format_spec
         else:
-            preset_name = self.format_combo.currentText()
-            format_preset = FORMAT_PRESETS.get(preset_name, "best")
+            fmt_data = self.format_combo.currentData()
+            if isinstance(fmt_data, str) and "+" in fmt_data:
+                format_preset = fmt_data
+            elif self._format_spec:
+                format_preset = self._format_spec
+            else:
+                preset_name = self.format_combo.currentText()
+                format_preset = FORMAT_PRESETS.get(preset_name, "best")
 
         base_kwargs = {
             "save_path": self.dir_input.text(),
@@ -1100,7 +1608,6 @@ class AddTaskDialog(QDialog):
         }
 
         url = self.url_input.text().strip()
-        is_playlist = self.download_playlist_checkbox.isChecked()
         # playlist_items_str：FormatPreviewDialog 返回的（优先）> 用户手动输入的
         playlist_items_str = self._playlist_items_str or (
             self.playlist_items_input.text().strip() or None
